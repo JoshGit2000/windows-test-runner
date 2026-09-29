@@ -1,0 +1,188 @@
+
+name: Secure Windows RDP - Development Testing
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  windows-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+
+      - name: Configure secure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "RDP_PASSWORD secret is missing."
+          }
+
+          if ($env:RDP_PASSWORD.Length -lt 16) {
+              throw "RDP password must be at least 16 characters."
+          }
+
+          # Create a non-administrator RDP user
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name "RDP" -Password $securePass
+          }
+          else {
+              New-LocalUser -Name "RDP" `
+                -Password $securePass `
+                -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "RDP" `
+            -ErrorAction SilentlyContinue
+
+          # Enable RDP
+          $base = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $rdp = "$base\WinStations\RDP-Tcp"
+
+          Set-ItemProperty -Path $base `
+            -Name "fDenyTSConnections" -Value 0
+
+          # Require Network Level Authentication
+          Set-ItemProperty -Path $rdp `
+            -Name "UserAuthentication" -Value 1
+
+          # Require TLS security
+          Set-ItemProperty -Path $rdp `
+            -Name "SecurityLayer" -Value 2
+
+          # Disable broad built-in RDP firewall rules
+          Get-NetFirewallRule -Name "RemoteDesktop*" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService -ErrorAction SilentlyContinue
+
+          Write-Host "Secure RDP configuration completed."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.102.4-amd64.msi"
+          $msi = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $msi
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList @(
+              "/i",
+              "`"$msi`"",
+              "/quiet",
+              "/norestart"
+            ) `
+            -Wait -PassThru
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installation failed."
+          }
+
+          Remove-Item $msi -Force
+
+          Write-Host "Tailscale installed."
+
+      - name: Connect Tailscale and secure firewall
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:TAILSCALE_AUTHKEY) {
+              throw "TAILSCALE_AUTHKEY secret is missing."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname = "gh-test-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+
+          & $ts up `
+            --auth-key="$env:TAILSCALE_AUTHKEY" `
+            --hostname="$hostname" `
+            --unattended=true
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale authentication failed."
+          }
+
+          # Wait for Tailscale IP
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 15; $i++) {
+              $candidate = (& $ts ip -4 2>$null |
+                Select-Object -First 1)
+
+              if ($candidate -match "^100\.") {
+                  $tsIP = $candidate.Trim()
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+              throw "Tailscale IP was not assigned."
+          }
+
+          # Allow RDP only to the Tailscale IP
+          # From Tailscale IPv4 source addresses
+          New-NetFirewallRule `
+            -Name "GH-Tailscale-RDP" `
+            -DisplayName "RDP via Tailscale Only" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -LocalAddress $tsIP `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Write-Host ""
+          Write-Host "========== RDP CONNECTION =========="
+          Write-Host "Address : $tsIP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Use your RDP_PASSWORD secret"
+          Write-Host "===================================="
+          Write-Host ""
+
+      - name: Verify RDP service
+        shell: pwsh
+        run: |
+          $service = Get-Service TermService
+
+          if ($service.Status -ne "Running") {
+              throw "RDP service is not running."
+          }
+
+          Write-Host "RDP service is running."
+
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object NumberOfLogicalProcessors, TotalPhysicalMemory
+
+          Write-Host "Runner ready for development/testing."
+
+      - name: Keep testing session available
+        shell: pwsh
+        run: |
+          Write-Host "Development/testing session active."
+          Write-Host "Cancel this workflow to terminate it."
+
+          while ($true) {
+              Start-Sleep -Seconds 60
+          }
