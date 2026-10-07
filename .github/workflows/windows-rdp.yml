@@ -7,8 +7,8 @@ on:
 permissions: {}
 
 jobs:
-  windows-rdp:
-    runs-on: windows-2022
+  ubuntu:
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
