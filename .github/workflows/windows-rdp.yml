@@ -46,6 +46,13 @@ jobs:
             -Member "RDP" `
             -ErrorAction SilentlyContinue
 
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "RDP" `
+            -ErrorAction Stop
+
+          Write-Host "RDP user granted Administrator privileges."
+
           # Enable RDP
           $base = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
           $rdp = "$base\WinStations\RDP-Tcp"
